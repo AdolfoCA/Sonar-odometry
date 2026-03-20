@@ -1,0 +1,10 @@
+stages:
+  - test
+
+build-ros-noetic:
+  stage: test
+  image: amarburg/drone-ci-ros-noetic:latest
+  script:
+    - wget -O- https://gitlab.com/amarburg/ros_drone_ci/-/raw/master/bootstrap.sh | /bin/bash
+  variables:
+    WSTOOL_RECURSIVE: "true"

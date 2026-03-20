@@ -1,0 +1,17 @@
+numpy==1.26.0
+scipy==1.15.0
+opencv-python
+cv-bridge
+matplotlib
+pandas==2.2.3
+scikit-image
+scikit-learn
+kappe
+nbformat
+plotly
+jupyter
+jupyterlab
+ipykernel
+ipywidgets
+kaleido
+seaborn

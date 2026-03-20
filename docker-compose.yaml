@@ -1,0 +1,48 @@
+services:
+  sonar3d:
+    container_name: sonar_odometry
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USERNAME: rosdev
+        GID: 1000
+        UID: 1000
+    environment:
+      - USERNAME=rosdev
+      - GID=1000
+      - UID=1000
+      - "FASTRTPS_DEFAULT_PROFILES_FILE=/usr/local/share/middleware_profiles/rtps_udp_profile.xml"
+      - DISPLAY=:0
+      - XDG_RUNTIME_DIR=/tmp/runtime-rosdev
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      # X11 forwarding
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /home/adolfo/.Xauthority:/home/rosdev/.Xauthority:rw
+      # Time sync
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      # Device access
+      - /dev/*:/dev/*
+      # Workspace sources (bind mount for live editing)
+      - ./ros2_ws/src:/home/rosdev/ros2_ws/src:cached
+      # Named volumes for build caches
+      - ros_build:/home/rosdev/ros2_ws/build
+      - ros_install:/home/rosdev/ros2_ws/install
+      - ros_log:/home/rosdev/ros2_ws/log
+    network_mode: "host"
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.8.8
+    tty: true
+    stdin_open: true
+    privileged: true
+    restart: always
+    command: /bin/bash -c "source /home/rosdev/ros2_ws/install/setup.bash && bash"
+
+volumes:
+  ros_build:
+  ros_install:
+  ros_log:

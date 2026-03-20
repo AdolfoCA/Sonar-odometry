@@ -1,0 +1,5 @@
+repositories:
+  genmypy:
+    type: git
+    url: http://github.com/rospypi/genmypy.git
+    version: master
