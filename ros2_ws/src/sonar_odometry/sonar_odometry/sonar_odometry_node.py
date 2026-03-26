@@ -16,8 +16,8 @@ Frame conventions (matching the notebook):
   - nav_msgs/Odometry is published with:
       frame_id       = "odom"   (NED)
       child_frame_id = "base_link"  (FRD body)
-      pose.position.x = North (m)
-      pose.position.y = East  (m)
+      pose.position.x = East  (m)   (EKF px = East)
+      pose.position.y = North (m)   (EKF py = North)
       pose.position.z = 0
       orientation     = quaternion from heading (yaw only)
 
@@ -50,7 +50,16 @@ Parameters (all settable via ROS params or a YAML config file)
 
 from __future__ import annotations
 
+import os
 import threading
+
+# Default debug output dir: ros2_ws/debug
+# ament_index gives us install/<pkg>/share/<pkg>; four levels up is the workspace root.
+from ament_index_python.packages import get_package_share_directory as _get_share
+_WS_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+    _get_share("sonar_odometry")
+))))
+_DEFAULT_DEBUG_DIR = os.path.join(_WS_ROOT, "debug")
 import time
 import numpy as np
 import cv2
@@ -68,7 +77,7 @@ from builtin_interfaces.msg import Time
 from marine_acoustic_msgs.msg import ProjectedSonarImage
 
 try:
-    from tf2_ros import TransformBroadcaster
+    from tf2_ros import TransformBroadcaster, Buffer, TransformListener
     TF2_AVAILABLE = True
 except ImportError:
     TF2_AVAILABLE = False
@@ -81,6 +90,22 @@ from .feature_matching import SonarFeatureMatcher
 # ---------------------------------------------------------------------------
 # Helper utilities
 # ---------------------------------------------------------------------------
+
+def quaternion_to_rotation_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+    """Convert a quaternion to a 3×3 rotation matrix."""
+    n = qx*qx + qy*qy + qz*qz + qw*qw
+    if n < 1e-10:
+        return np.eye(3)
+    s = 2.0 / n
+    wx, wy, wz = s*qw*qx, s*qw*qy, s*qw*qz
+    xx, xy, xz = s*qx*qx, s*qx*qy, s*qx*qz
+    yy, yz, zz = s*qy*qy, s*qy*qz, s*qz*qz
+    return np.array([
+        [1.0-(yy+zz),    xy-wz,       xz+wy    ],
+        [   xy+wz,    1.0-(xx+zz),    yz-wx    ],
+        [   xz-wy,       yz+wx,    1.0-(xx+yy)],
+    ])
+
 
 def heading_to_quaternion(theta: float) -> tuple[float, float, float, float]:
     """
@@ -154,14 +179,26 @@ class SonarOdometryNode(Node):
         self.declare_parameter("sonar_scale_right",    1.3)
         self.declare_parameter("sonar_scale_heading",  1.27)
         self.declare_parameter("nis_threshold",        30.0)
+        self.declare_parameter("lowe_ratio",           0.50)
         self.declare_parameter("min_inliers",          6)
         self.declare_parameter("min_inlier_ratio",     0.3)
         self.declare_parameter("publish_tf",           False)
+        self.declare_parameter("imu_frame_id",         "imu_link")
+        self.declare_parameter("sonar_frame_id",       "sonar_link")
+        self.declare_parameter("debug_image_dir",      _DEFAULT_DEBUG_DIR)
+        self.declare_parameter("debug_save_n_images",  20)
         # IMU noise (from IAM-20680HT datasheet defaults)
-        self.declare_parameter("n_accel_ug_sqrthz",   135.0)
-        self.declare_parameter("n_gyro_dps_sqrthz",   0.005)
-        self.declare_parameter("sigma_sonar_pos",      0.023464)
-        self.declare_parameter("sigma_sonar_heading",  0.023464)
+        self.declare_parameter("n_accel_ug_sqrthz",       135.0)
+        self.declare_parameter("n_gyro_dps_sqrthz",       0.005)
+        self.declare_parameter("sigma_sonar_pos",          0.023464)
+        self.declare_parameter("sigma_sonar_heading",      0.023464)
+        self.declare_parameter("bilateral_d",              9)
+        self.declare_parameter("bilateral_sigma_color",    75.0)
+        self.declare_parameter("bilateral_sigma_space",    75.0)
+        self.declare_parameter("clahe_clip_limit",         3.0)
+        self.declare_parameter("clahe_tile_grid_size",     8)
+        self.declare_parameter("use_gps_initial_heading",  True)
+        self.declare_parameter("gps_heading_min_dist_m",   2.0)
 
     def _load_parameters(self):
         gp = self.get_parameter
@@ -170,20 +207,36 @@ class SonarOdometryNode(Node):
         self.odom_topic      = gp("odom_topic").value
         self.odom_frame_id   = gp("odom_frame_id").value
         self.base_frame_id   = gp("base_frame_id").value
-        self.initial_heading = np.deg2rad(gp("initial_heading_deg").value)
+        # Convert compass heading (CW from North) to ENU yaw (CCW from East)
+        self.initial_heading = np.pi / 2.0 - np.deg2rad(gp("initial_heading_deg").value)
         self.accel_bias      = (gp("accel_bias_x").value, gp("accel_bias_y").value, 0.0)
         self.gyro_bias_z     = gp("gyro_bias_z").value
         self.scale_fwd       = gp("sonar_scale_forward").value
         self.scale_right     = gp("sonar_scale_right").value
         self.scale_heading   = gp("sonar_scale_heading").value
         self.nis_threshold   = gp("nis_threshold").value
+        self.lowe_ratio      = gp("lowe_ratio").value
         self.min_inliers     = gp("min_inliers").value
         self.min_inlier_ratio= gp("min_inlier_ratio").value
         self.publish_tf_flag = gp("publish_tf").value
+        self.imu_frame_id      = gp("imu_frame_id").value
+        self.sonar_frame_id    = gp("sonar_frame_id").value
+        self.debug_image_dir   = gp("debug_image_dir").value
+        self.debug_save_n      = gp("debug_save_n_images").value
         self.n_accel         = gp("n_accel_ug_sqrthz").value
         self.n_gyro          = gp("n_gyro_dps_sqrthz").value
         self.sigma_sonar_pos = gp("sigma_sonar_pos").value
         self.sigma_sonar_hdg = gp("sigma_sonar_heading").value
+        self.use_gps_initial_heading  = gp("use_gps_initial_heading").value
+        self.gps_heading_min_dist     = gp("gps_heading_min_dist_m").value
+        tile = gp("clahe_tile_grid_size").value
+        self._img_proc_config = {
+            "bilateral_d":          gp("bilateral_d").value,
+            "bilateral_sigma_color":gp("bilateral_sigma_color").value,
+            "bilateral_sigma_space":gp("bilateral_sigma_space").value,
+            "clahe_clip_limit":     gp("clahe_clip_limit").value,
+            "clahe_tile_grid":      (tile, tile),
+        }
 
     # ----------------------------------------------------------------- init
     def _init_ekf(self):
@@ -200,12 +253,17 @@ class SonarOdometryNode(Node):
         self._prev_imu_time: float | None = None
         self._is_initialized: bool = False       # becomes True after first IMU
         self._sonar_count: int = 0
+        # Cached rotation matrices from TF (looked up once on first use)
+        self._R_imu_to_body:   np.ndarray | None = None
+        self._R_sonar_to_body: np.ndarray | None = None
 
     def _init_processing(self):
         self._processor = SonarImageProcessor()
-        self._matcher   = SonarFeatureMatcher()
+        self._processor.config.update(self._img_proc_config)
+        self._matcher   = SonarFeatureMatcher(lowe_ratio=self.lowe_ratio)
         self._prev_sonar_img: np.ndarray | None = None
         self._prev_sonar_stamp: float | None = None
+        self._debug_img_count: int = 0
 
     def _create_interfaces(self):
         best_effort_qos = QoSProfile(
@@ -231,24 +289,111 @@ class SonarOdometryNode(Node):
         self._path_msg = Path()
         self._path_msg.header.frame_id = self.odom_frame_id
 
-        self._gps_path_pub = self.create_publisher(Path, "/gps/path", reliable_qos)
-        self._gps_path_msg = Path()
-        self._gps_path_msg.header.frame_id = self.odom_frame_id
-        self._gps_origin: tuple | None = None
-        self._gps_sub = self.create_subscription(
-            NavSatFix, "/fix", self._gps_callback, best_effort_qos
-        )
+        # GPS heading initialisation (runs once then stops updating)
+        self._gps_first_fix:   tuple | None = None
+        self._gps_heading_set: bool         = False
+        if self.use_gps_initial_heading:
+            self._gps_heading_sub = self.create_subscription(
+                NavSatFix, "/fix", self._gps_heading_callback, best_effort_qos
+            )
+            self.get_logger().info(
+                f"GPS heading init enabled — waiting for {self.gps_heading_min_dist:.1f} m displacement."
+            )
+        else:
+            self._gps_heading_sub = None
+
+        if TF2_AVAILABLE:
+            self._tf_buffer   = Buffer()
+            self._tf_listener = TransformListener(self._tf_buffer, self)
+        else:
+            self._tf_buffer   = None
+            self._tf_listener = None
+            self.get_logger().error("tf2_ros not available — frame transforms will not work.")
 
         if self.publish_tf_flag and TF2_AVAILABLE:
             self._tf_broadcaster = TransformBroadcaster(self)
         else:
             self._tf_broadcaster = None
 
+    # -------------------------------------------------- TF rotation lookup
+    def _lookup_rotation(self, source_frame: str, target_frame: str) -> np.ndarray | None:
+        """
+        Look up the static TF from source_frame to target_frame and return the
+        3×3 rotation matrix.  Returns None if the transform is not yet available.
+        """
+        if self._tf_buffer is None:
+            return None
+        try:
+            t = self._tf_buffer.lookup_transform(
+                target_frame, source_frame, rclpy.time.Time()
+            )
+            q = t.transform.rotation
+            R = quaternion_to_rotation_matrix(q.x, q.y, q.z, q.w)
+            self.get_logger().info(
+                f"TF: cached rotation {source_frame} → {target_frame}\n{R}"
+            )
+            return R
+        except Exception as e:
+            self.get_logger().warn(
+                f"TF lookup {source_frame} → {target_frame} failed: {e}",
+                throttle_duration_sec=5.0,
+            )
+            return None
+
+    # ------------------------------------------- GPS heading initialisation
+    _EARTH_R = 6_371_000.0
+
+    def _gps_heading_callback(self, msg: NavSatFix) -> None:
+        """
+        Runs until the vehicle has moved gps_heading_min_dist metres, then
+        computes the GPS bearing, resets ekf.theta, and stops listening.
+
+        The bearing is derived from the displacement vector (east, north) so
+        it maps directly to an ENU yaw without any intermediate conversion.
+        """
+        if self._gps_heading_set or msg.status.status < 0:
+            return
+
+        lat, lon = msg.latitude, msg.longitude
+
+        if self._gps_first_fix is None:
+            self._gps_first_fix = (lat, lon)
+            return
+
+        lat0, lon0 = self._gps_first_fix
+        north = np.deg2rad(lat - lat0) * self._EARTH_R
+        east  = np.deg2rad(lon - lon0) * self._EARTH_R * np.cos(np.deg2rad(lat0))
+        dist  = np.hypot(north, east)
+
+        if dist < self.gps_heading_min_dist:
+            return  # not enough displacement yet for a reliable bearing
+
+        # atan2(north, east) is the ENU yaw directly (CCW from East)
+        heading_enu = np.arctan2(north, east)
+
+        with self._lock:
+            self.ekf.theta = heading_enu
+
+        self._gps_heading_set = True
+        self.get_logger().info(
+            f"GPS heading initialised: {np.rad2deg(heading_enu):.2f}° ENU  "
+            f"({90.0 - np.rad2deg(heading_enu):.2f}° compass)  "
+            f"from {dist:.2f} m GPS displacement"
+        )
+
     # ---------------------------------------------------------- IMU callback
     def _imu_callback(self, msg: Imu) -> None:
         stamp = ros_time_to_sec(msg.header.stamp)
 
         with self._lock:
+            # Lazy TF lookup — cached after first success
+            if self._R_imu_to_body is None:
+                self._R_imu_to_body = self._lookup_rotation(
+                    self.imu_frame_id, self.base_frame_id
+                )
+                if self._R_imu_to_body is None:
+                    return  # TF not ready yet
+
             if self._prev_imu_time is None:
                 self._prev_imu_time = stamp
                 self._is_initialized = True
@@ -263,11 +408,21 @@ class SonarOdometryNode(Node):
                 self._prev_imu_time = stamp
                 return
 
-            ax_frd =  msg.linear_acceleration.x
-            ay_frd = -msg.linear_acceleration.y
-            gz_frd = -msg.angular_velocity.z
+            # Rotate from IMU sensor frame to FRD body frame via TF
+            a_imu = np.array([msg.linear_acceleration.x,
+                               msg.linear_acceleration.y,
+                               msg.linear_acceleration.z])
+            w_imu = np.array([msg.angular_velocity.x,
+                               msg.angular_velocity.y,
+                               msg.angular_velocity.z])
+            a_body = self._R_imu_to_body @ a_imu
+            w_body = self._R_imu_to_body @ w_imu
 
-            u = np.array([ax_frd, ay_frd, gz_frd])
+            # EKF expects [ax_frd, ay_frd, gz_frd]:
+            #   ax_frd = forward accel  (body X)
+            #   ay_frd = rightward accel (body Y)
+            #   gz_frd = yaw rate, CW positive (body Z)
+            u = np.array([a_body[0], a_body[1], w_body[2]])
             self.ekf.prediction(u, dt)
             self._prev_imu_time = stamp
 
@@ -276,6 +431,9 @@ class SonarOdometryNode(Node):
     # -------------------------------------------------------- sonar callback
     def _sonar_callback(self, msg: ProjectedSonarImage) -> None:
         t0 = time.time()
+
+        # Populate sonar geometry from this message (no-op after first call)
+        self._matcher.update_sonar_params(msg)
 
         img = projected_sonar_to_cv2(msg)
         if img is None:
@@ -288,6 +446,20 @@ class SonarOdometryNode(Node):
 
         img_proc = self._processor.process_image(img)
         t_preproc = time.time()
+
+        # Save raw + processed images for the first N frames
+        if self._debug_img_count < self.debug_save_n:
+            try:
+                os.makedirs(self.debug_image_dir, exist_ok=True)
+                idx = self._debug_img_count
+                cv2.imwrite(os.path.join(self.debug_image_dir, f"sonar_raw_{idx:03d}.png"), img)
+                # processed image is float [0,1] → scale to uint8 for saving
+                proc_uint8 = (img_proc * 255).astype(np.uint8) if img_proc.dtype != np.uint8 else img_proc
+                cv2.imwrite(os.path.join(self.debug_image_dir, f"sonar_proc_{idx:03d}.png"), proc_uint8)
+                self.get_logger().info(f"Debug: saved sonar frame {idx} to {self.debug_image_dir}")
+            except Exception as e:
+                self.get_logger().warn(f"Debug: could not save image {self._debug_img_count}: {e}")
+            self._debug_img_count += 1
 
         with self._lock:
             if not self._is_initialized:
@@ -362,42 +534,30 @@ class SonarOdometryNode(Node):
         if result["inlier_ratio"] < self.min_inlier_ratio:
             return None
 
+        # Lazy TF lookup — cached after first success
+        if self._R_sonar_to_body is None:
+            self._R_sonar_to_body = self._lookup_rotation(
+                self.sonar_frame_id, self.base_frame_id
+            )
+            if self._R_sonar_to_body is None:
+                return None
+
         dp = T[0:2, 2].copy()
-        dR  = T[0:2, 0:2]
+        dR = T[0:2, 0:2]
         dtheta = np.arctan2(dR[1, 0], dR[0, 0])
 
-        # Apply empirical scale calibration (matching notebook)
+        # Apply empirical scale calibration
         dp[0] *= self.scale_fwd
         dp[1] *= self.scale_right
         dtheta *= self.scale_heading
 
-        # Notebook convention: z = [forward, -right_raw, dtheta]
-        # dp[0] = forward displacement, dp[1] = lateral (right in body frame after inversion)
-        z = np.array([dp[0], -dp[1], dtheta])
-        return z
+        # Rotate displacement from sonar frame into FRD body frame via TF.
+        # The 2×2 top-left of R handles the XY-plane rotation (yaw offset between frames).
+        # R[2,2] handles the sign of the heading change (e.g. -1 if sonar is mounted upside-down).
+        dp_body     = self._R_sonar_to_body[:2, :2] @ dp
+        dtheta_body = float(self._R_sonar_to_body[2, 2]) * dtheta
 
-    # ----------------------------------------------------------- GPS callback
-    _EARTH_R = 6_371_000.0
-
-    def _gps_callback(self, msg: NavSatFix) -> None:
-        if msg.status.status < 0:
-            return
-        lat, lon = msg.latitude, msg.longitude
-        if self._gps_origin is None:
-            self._gps_origin = (lat, lon)
-            self.get_logger().info(f"GPS origin set: lat={lat:.7f}  lon={lon:.7f}")
-        lat0, lon0 = self._gps_origin
-        north = np.deg2rad(lat - lat0) * self._EARTH_R
-        east  = np.deg2rad(lon - lon0) * self._EARTH_R * np.cos(np.deg2rad(lat0))
-        pose = PoseStamped()
-        pose.header.stamp    = msg.header.stamp
-        pose.header.frame_id = self.odom_frame_id
-        pose.pose.position.x = north
-        pose.pose.position.y = east
-        pose.pose.orientation.w = 1.0
-        self._gps_path_msg.header.stamp = msg.header.stamp
-        self._gps_path_msg.poses.append(pose)
-        self._gps_path_pub.publish(self._gps_path_msg)
+        return np.array([dp_body[0], dp_body[1], dtheta_body])
 
     # ----------------------------------------------------- publish odometry
     def _publish_odometry(self, stamp: Time, update_path: bool = False) -> None:
@@ -436,9 +596,10 @@ class SonarOdometryNode(Node):
         msg.pose.covariance = cov6.flatten().tolist()
 
         # Twist (body-frame velocities)
+        # ENU: vx=East, vy=North; Forward=[cos θ, sin θ], Right=[sin θ, -cos θ]
         c, s = np.cos(theta), np.sin(theta)
-        vx_body =  c * vx + s * vy
-        vy_body = -s * vx + c * vy
+        vx_body = c * vx + s * vy    # forward
+        vy_body = s * vx - c * vy    # right
         msg.twist.twist.linear.x = vx_body
         msg.twist.twist.linear.y = vy_body
         msg.twist.twist.linear.z = 0.0

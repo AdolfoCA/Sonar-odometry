@@ -24,6 +24,7 @@ setup(
     entry_points={
         "console_scripts": [
             f"sonar_odometry_node = {package_name}.sonar_odometry_node:main",
+            f"gps_path_node = {package_name}.gps_path:main",
         ],
     },
 )

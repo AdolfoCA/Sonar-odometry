@@ -2,77 +2,89 @@ import numpy as np
 import cv2
 
 
-def get_default_sonar_params():
-        """Default sonar parameters from your data"""
-        return {
-            'frequency': 749001.3125,
-            'sound_speed': 1480.033935546875,
-            'beam_count': 512,
-            'azimuth_min_deg': -65.0,
-            'azimuth_max_deg': 65.0,
-            'azimuth_span_deg': 130.0,
-            'beam_spacing_deg': 0.2544031383028491,
-            'range_bins': 633,
-            'min_range_m': 0.007893514,
-            'max_range_m': 9.985295,
-            'range_resolution_m': 0.015787028,
-            'is_uniform_beams': False,
-            'is_uniform_range': True
-        }
-
 
 
 class SonarFeatureMatcher:
 
-    def __init__(self):
+    def __init__(self, lowe_ratio: float = 0.50):
+        """
+        Parameters
+        ----------
+        lowe_ratio : Lowe's ratio-test threshold for match filtering.
+                     Lower values = stricter (fewer but more reliable matches).
+        """
+        self._lowe_ratio = lowe_ratio
+        # Sonar geometry — populated from the first ROS message via update_sonar_params()
+        self._beam_azimuths_rad: np.ndarray | None = None   # shape (beam_count,)
+        self._ranges_m: np.ndarray | None = None             # shape (range_bins,)
         self._detector = cv2.AKAZE_create(
             descriptor_type=cv2.AKAZE_DESCRIPTOR_MLDB,
             descriptor_size=0,
             descriptor_channels=3,
-            threshold=0.0001,
+            threshold=0.001,
             nOctaves=8,
             nOctaveLayers=8,
             diffusivity=cv2.KAZE_DIFF_PM_G2
         )
 
-    ## This returns the transofrmation estimation between two sonar images
+    def set_sonar_params(self, beam_azimuths_rad: np.ndarray, ranges_m: np.ndarray) -> None:
+        """
+        Set sonar geometry directly from numpy arrays.
+        Useful for notebooks and unit tests where no ROS message is available.
+
+        Parameters
+        ----------
+        beam_azimuths_rad : azimuth angle (rad) for each beam column, shape (n_beams,)
+        ranges_m          : range (m) at each bin centre, shape (n_bins,)
+        """
+        self._beam_azimuths_rad = np.asarray(beam_azimuths_rad, dtype=np.float32)
+        self._ranges_m          = np.asarray(ranges_m,          dtype=np.float32)
+
+    def update_sonar_params(self, msg) -> None:
+        """
+        Extract and cache sonar geometry from a ProjectedSonarImage message.
+        Called once on the first message; ignored on subsequent calls.
+
+        Geometry convention (from marine_acoustic_msgs):
+          - Z-axis forward (boresight), beams in Y-Z plane
+          - Azimuth = rotation about X  →  atan2(beam_direction.y, beam_direction.z)
+          - msg.ranges contains the actual range (m) of each bin centre
+        """
+        if self._beam_azimuths_rad is not None:
+            return  # already cached
+
+        if not msg.beam_directions or not msg.ranges:
+            return  # message not yet populated
+
+        self._beam_azimuths_rad = np.array(
+            [np.arctan2(bd.y, bd.z) for bd in msg.beam_directions],
+            dtype=np.float32,
+        )
+        self._ranges_m = np.array(msg.ranges, dtype=np.float32)
+
     def polar_to_cartesian_coords(self, col: float, row: float) -> np.ndarray:
         """
-        Convert polar sonar coordinates to Cartesian coordinates.
-        
-        Args:
-            col: Column index (azimuth/beam index)
-            row: Row index (range bin)
-            sonar_params: Sonar configuration parameters
-            
-        Returns:
-            Cartesian coordinates [x, y] in meters
+        Convert polar sonar image coordinates to Cartesian (metres).
+
+        Uses the geometry cached from the ROS message via update_sonar_params().
+        Sub-pixel (col, row) values are handled with linear interpolation.
+
+        Returns [x, y]:  x = forward (boresight),  y = right (positive starboard)
         """
-        sonar_params = get_default_sonar_params()
-        # Extract sonar parameters
-        azimuth_span_deg = sonar_params.get('azimuth_span_deg')
-        azimuth_min_deg = sonar_params.get('azimuth_min_deg')
-        beam_count = sonar_params.get('beam_count')
-        min_range_m = sonar_params.get('min_range_m')
-        max_range_m = sonar_params.get('max_range_m')
-        range_bins = sonar_params.get('range_bins')
-        beam_spacing_deg = 0.2544
-        range_resolution_m = 0.015787028
-        
-        # Calculate angle for this beam
-        angle_deg = azimuth_min_deg + (col * beam_spacing_deg)
-        angle_rad = np.deg2rad(angle_deg)
-        
-        # Calculate range for this bin
-        range_m = min_range_m + (row * range_resolution_m)
-        
-        # Convert to Cartesian coordinates
-        x = range_m * np.cos(angle_rad)
-        y = range_m * np.sin(angle_rad)
-        
+        if self._beam_azimuths_rad is None or self._ranges_m is None:
+            raise RuntimeError(
+                "Sonar geometry not set. Call update_sonar_params(msg) before matching."
+            )
+
+        col_idx = np.arange(len(self._beam_azimuths_rad), dtype=np.float32)
+        row_idx = np.arange(len(self._ranges_m),          dtype=np.float32)
+
+        azimuth = float(np.interp(col, col_idx, self._beam_azimuths_rad))
+        range_m = float(np.interp(row, row_idx, self._ranges_m))
+
+        x = range_m * np.cos(azimuth)    # forward
+        y = -range_m * np.sin(azimuth)  # right (positive starboard); negate because beam_directions.y is port-positive in marine_acoustic_msgs
         return np.array([x, y], dtype=np.float32)
-        # X: forward 
-        # Y: right
 
 ######################## AKAZE ###############################
     
@@ -86,26 +98,28 @@ class SonarFeatureMatcher:
         
         return keypoints, descriptors
 
-    def match_sonar_features(self, desc1, desc2, distance_threshold=0.50): # 0.50 is a good one
+    def match_sonar_features(self, desc1, desc2, distance_threshold=None):
         """
         Match features using BFMatcher with Hamming distance for MLDB_UPRIGHT.
         """
+        threshold = distance_threshold if distance_threshold is not None else self._lowe_ratio
+
         if desc1 is None or desc2 is None or len(desc1) == 0 or len(desc2) == 0:
             return []
-        
+
         # Use BFMatcher with HAMMING distance for binary descriptors
         matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-        
+
         # Find 2 nearest neighbors for ratio test
         knn_matches = matcher.knnMatch(desc1, desc2, k=2)
-        
+
         # Apply Lowe's ratio test
         good_matches = []
         for match_pair in knn_matches:
             if len(match_pair) < 2:
                 continue
             m, n = match_pair
-            if m.distance < distance_threshold * n.distance:
+            if m.distance < threshold * n.distance:
                 good_matches.append(m)
         
         return good_matches
@@ -137,6 +151,7 @@ class SonarFeatureMatcher:
         ])
         
         # Use meter-based threshold for Cartesian coordinates
+        #TODO: I also want to set this threshold in the config file.
         ranges = np.linalg.norm(pts1_cart, axis=1)
         #reproj_threshold_m = max(0.05, np.median(ranges) * 0.03)  # 3% of median range
         #print (f"Reprojection threshold (m): {reproj_threshold_m}")

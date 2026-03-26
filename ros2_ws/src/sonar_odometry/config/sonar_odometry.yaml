@@ -1,11 +1,31 @@
+imu_filter_madgwick_node:
+  ros__parameters:
+    # ── Madgwick filter ────────────────────────────────────────────────────
+    use_mag: false                # no magnetometer on this vehicle
+    publish_tf: false             # TF is handled by sonar_odometry_node
+    publish_debug_topics: false
+    world_frame: "ned"            # output orientation in NED frame
+    gain: 0.1                     # Madgwick beta gain (higher = faster convergence, more noise)
+    zeta: 0.0                     # gyro drift compensation gain (0 = disabled)
+    orientation_stddev: 0.0       # added to orientation covariance diagonal
+    constant_dt: 0.0              # 0 = use message timestamps
+
 sonar_odometry_node:
   ros__parameters:
     # ── Topics ─────────────────────────────────────────────────────────────
-    imu_topic: "/ouster/imu"                    # sensor_msgs/Imu  (gravity-compensated preferred)
-    sonar_topic: "/oculus/sonar_image"        # sensor_msgs/Image (polar sonar frame)
-    odom_topic: "/odometry"                   # nav_msgs/Odometry (output)
+    imu_topic: "/imu/data"                      # filtered IMU output from Madgwick node
+    sonar_topic: "/oculus/sonar_image"          # sensor_msgs/Image (polar sonar frame)
+    odom_topic: "/odometry"                     # nav_msgs/Odometry (output)
     odom_frame_id: "odom"
     base_frame_id: "base_link"
+
+    # ── Sensor TF frames ───────────────────────────────────────────────────
+    # The node looks up the static TF from each sensor frame to base_frame_id
+    # and uses it to rotate measurements into the FRD body frame.
+    # Publish these transforms with a static_transform_publisher or robot_state_publisher.
+    imu_frame_id:   "imu"
+    sonar_frame_id: "oculus"
+
 
     # ── Initial conditions ─────────────────────────────────────────────────
     # Set initial_heading_deg to the vehicle's true heading at startup
@@ -28,11 +48,27 @@ sonar_odometry_node:
     # ── Sonar scale calibration ────────────────────────────────────────────
     # Empirical scale factors matching the notebook (beta / gamma).
     # Tune these on a straight-line calibration run.
-    sonar_scale_forward: 1.3
-    sonar_scale_right:   1.3
-    sonar_scale_heading: 1.27
+    sonar_scale_forward: 1.3   # increased from 1.3 — sonar was underestimating displacement ~2.3×
+    sonar_scale_right:   1.3   # same correction applied laterally
+    sonar_scale_heading: 1.4
+
+    # ── GPS heading initialisation ─────────────────────────────────────────
+    # On startup the node listens to /fix and waits until the vehicle has
+    # moved gps_heading_min_dist_m metres, then computes the GPS bearing and
+    # resets the EKF heading to that value (overriding initial_heading_deg).
+    # Set use_gps_initial_heading: false to use initial_heading_deg instead.
+    use_gps_initial_heading: true
+    gps_heading_min_dist_m:  2.0   # metres of GPS displacement required
+
+    # ── Image processing pipeline (Bilateral → CLAHE) ──────────────────────
+    bilateral_d:           9      # pixel neighbourhood diameter
+    bilateral_sigma_color: 75.0   # colour-space sigma (higher = more colour mixing)
+    bilateral_sigma_space: 75.0   # spatial sigma (higher = farther pixels influence each other)
+    clahe_clip_limit:      3.0    # contrast limit (higher = stronger enhancement, more noise)
+    clahe_tile_grid_size:  8      # CLAHE tile grid (NxN tiles)
 
     # ── EKF tuning ─────────────────────────────────────────────────────────
+    lowe_ratio:       0.50               # Lowe's ratio test threshold (lower = stricter matches)
     nis_threshold:    30.0               # NIS gating threshold (chi2, dof=3 → 99th pct ≈ 11.3)
     min_inliers:      6
     min_inlier_ratio: 0.3

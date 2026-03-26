@@ -5,18 +5,28 @@ import cv2
 class SonarImageProcessor:
     def __init__(self):
         self.config = {
-            "apply_denoise": True, # always true
-            "apply_gaussian": True,
-            "apply_median": True,
-            "apply_otsu": False, # always false
-            "apply_fuzzy": True,
-            "apply_opening": True,
+            # ── Active pipeline ───────────────────────────────────────────────
+            "bilateral_d":          9,      # diameter of pixel neighbourhood
+            "bilateral_sigma_color":75,     # filter sigma in colour space
+            "bilateral_sigma_space":75,     # filter sigma in coordinate space
+            "clahe_clip_limit":     3.0,    # contrast limit for CLAHE
+            "clahe_tile_grid":      (8, 8), # tile grid size for CLAHE
+            # ── Legacy filters (not used in process_image) ────────────────────
+            "apply_denoise": True,
+            "apply_unsharp": True,
+            "unsharp_ksize": 5,
+            "unsharp_strength": 1.5,
+            "apply_gaussian": False,
+            "apply_median": False,
+            "apply_otsu": False,
+            "apply_fuzzy": False,
+            "apply_opening": False,
             "gamma_value": 1.6,
             "gaussian_ksize": (3, 3),
             "gaussian_sigma": 0,
             "median_ksize": 3,
             "morph_kernel": cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
-            "final_normalization": False
+            "final_normalization": False,
         }
     
     def apply_denoising(self, img: np.ndarray) -> np.ndarray:
@@ -153,7 +163,7 @@ class SonarImageProcessor:
             #print(f"Warning: Morphological operations failed: {e}")
             return img
     
-    def threshold_image(self, img: np.ndarray, thresh: float = 0.50) -> np.ndarray:
+    def threshold_image(self, img: np.ndarray, thresh: float = 0.5) -> np.ndarray:
         """
         Apply simple thresholding to create a binary mask.
         
@@ -206,35 +216,75 @@ class SonarImageProcessor:
         return new_image
 
     
+    def apply_unsharp(self, img: np.ndarray) -> np.ndarray:
+        """
+        Apply unsharp masking to enhance edges and local contrast.
+
+        result = img + strength * (img - GaussianBlur(img))
+
+        Args:
+            img: Input image — uint8 [0, 255] or float32 [0, 1]
+
+        Returns:
+            Sharpened float32 image in [0, 1]
+        """
+        if not self.config.get("apply_unsharp", True):
+            return img
+
+        # Normalise to float32 [0, 1] regardless of input dtype
+        if img.dtype != np.float32:
+            img = img.astype(np.float32) / 255.0 if img.max() > 1 else img.astype(np.float32)
+
+        ksize = self.config.get("unsharp_ksize", 5)
+        strength = self.config.get("unsharp_strength", 1.5)
+
+        # ksize must be odd
+        if ksize % 2 == 0:
+            ksize += 1
+
+        blurred = cv2.GaussianBlur(img, (ksize, ksize), 0)
+        sharpened = img + strength * (img - blurred)
+        return np.clip(sharpened, 0.0, 1.0).astype(np.float32)
+
+    def apply_bilateral(self, img: np.ndarray) -> np.ndarray:
+        """
+        Edge-preserving bilateral filter.
+        Smooths noise while keeping sonar target boundaries sharp.
+        """
+        u8 = (np.clip(img, 0.0, 1.0) * 255).astype(np.uint8) if img.dtype != np.uint8 else img
+        filtered = cv2.bilateralFilter(
+            u8,
+            self.config["bilateral_d"],
+            self.config["bilateral_sigma_color"],
+            self.config["bilateral_sigma_space"],
+        )
+        return filtered.astype(np.float32) / 255.0
+
+    def apply_clahe(self, img: np.ndarray) -> np.ndarray:
+        """
+        Contrast-Limited Adaptive Histogram Equalisation.
+        Locally boosts contrast to make sonar targets more distinctive for AKAZE.
+        """
+        u8 = (np.clip(img, 0.0, 1.0) * 255).astype(np.uint8) if img.dtype != np.uint8 else img
+        clahe = cv2.createCLAHE(
+            clipLimit=self.config["clahe_clip_limit"],
+            tileGridSize=self.config["clahe_tile_grid"],
+        )
+        return clahe.apply(u8).astype(np.float32) / 255.0
+
     def process_image(self, img: np.ndarray) -> np.ndarray:
-        
-        # Apply denoising
-        if self.config.get("apply_denoise", False):
-            img = self.apply_denoising(img)
-        
-        # Apply smoothing
-        if self.config.get("apply_gaussian", False) or self.config.get("apply_median", False):
-            ##print("Applying smoothing...")
-            img = self.apply_smoothing(img)
-        
-        # Apply thresholding
-        if self.config.get("apply_otsu", False):
-            ##print("Applying Otsu thresholding...")
-            img = self.apply_thresholding(img)
-            ##print(f"Image size after Otsu thresholding: {img.shape}")
-        
-        # Apply enhancement
-        if self.config.get("apply_fuzzy", False):
-            img = self.apply_enhancement(img)
-        
-        # Apply morphological operations
-        if self.config.get("apply_opening", False):
-            img = self.apply_morphological_operations(img)
-        # Apply final normalization
-        if self.config.get("final_normalization", True):
-            img = self.apply_final_normalization(img)
-            
+        """
+        Active pipeline: Bilateral → CLAHE → crop.
+
+        Bilateral filter removes speckle noise while preserving edges,
+        then CLAHE locally enhances contrast to maximise AKAZE keypoint quality.
+        """
+        # Normalise input to float32 [0, 1]
+        if img.dtype != np.float32:
+            img = img.astype(np.float32) / 255.0 if img.max() > 1 else img.astype(np.float32)
+
+        img = self.apply_bilateral(img)
+        img = self.apply_clahe(img)
         img = self.size_image(img)
-        img = self.threshold_image(img, thresh=0.20)
 
         return img

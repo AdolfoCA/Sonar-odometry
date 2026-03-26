@@ -9,6 +9,7 @@
   <license>MIT</license>
 
   <depend>rclpy</depend>
+  <depend>imu_filter_madgwick</depend>
   <depend>marine_acoustic_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>nav_msgs</depend>

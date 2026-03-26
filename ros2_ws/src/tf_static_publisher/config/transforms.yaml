@@ -1,0 +1,93 @@
+# =============================================================================
+# transforms.yaml
+# Date: 2024-04-08
+# Sonar Configuration: 1 (forward-facing, 30 deg pitch, 0 deg roll)
+#
+# Tree structure:
+#   odom → os_imu          (dynamic, published by FastLIO2)
+#   os_imu → os_sensor     (static)
+#   os_sensor → os_lidar   (static)
+#   os_imu → base_link     (static — bridge to robot body frames)
+#   base_link → otter → otter_frd → sonar_joint1 → sonar_joint2 → sonar
+#   base_link → imu
+# =============================================================================
+
+transforms:
+
+  # --- os_imu to base_link (bridge to robot body) ---------------------------
+  # os_sensor is at base_link with 180 deg yaw rotation
+  # Combined: os_imu offset + inverse of os_sensor→base_link rotation
+  - frame_id: imu
+    child_frame_id: base_link
+    invert: false
+    translation:
+      x: 0.26
+      y: 0.0
+      z: -0.53
+    rotation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+
+  # --- Robot hull -----------------------------------------------------------
+  - frame_id: base_link
+    child_frame_id: otter
+    invert: false
+    translation:
+      x: -0.26
+      y: 0.0
+      z: 0.0
+    rotation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+
+  - frame_id: otter
+    child_frame_id: otter_frd
+    invert: true
+    translation:
+      x: 0.0
+      y: 0.0
+      z: 0.41
+    rotation:
+      x: 180.0   # Z axis pointing downwards
+      y: 0.0
+      z: 0.0
+
+  # --- Sonar mount chain ---------------------------------------------------
+  - frame_id: otter_frd
+    child_frame_id: sonar_joint1
+    invert: false
+    translation:
+      x: 0.0
+      y: 0.0
+      z: 1.24
+    rotation:
+      x: 0.0
+      y: -30.0   # pitch of sonar head
+      z: 0.0
+
+  - frame_id: sonar_joint1
+    child_frame_id: sonar_joint2
+    invert: false
+    translation:
+      x: 0.0
+      y: 0.0
+      z: 0.04
+    rotation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+
+  - frame_id: sonar_joint2
+    child_frame_id: oculus
+    invert: false
+    translation:
+      x: 0.1
+      y: 0.0
+      z: 0.12
+    rotation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+

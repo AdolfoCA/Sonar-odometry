@@ -3,11 +3,11 @@ Extended Kalman Filter for Sonar Inertial Odometry.
 
 State vector (10D):
   [px, py, vx, vy, theta, b_ax, b_ay, b_gz, s_ax, s_ay]
-   px, py    : position in NED frame (meters)
-   vx, vy    : velocity in NED frame (m/s)
-   theta     : heading (rad), zero = North, positive = East (clockwise)
-   b_ax, b_ay: accelerometer biases (m/s^2)
-   b_gz      : gyro yaw-rate bias (rad/s)
+   px, py    : position in ENU frame (meters); px = East, py = North
+   vx, vy    : velocity in ENU frame (m/s);    vx = East, vy = North
+   theta     : yaw (rad), zero = East, positive = North (CCW, right-hand z-up)
+   b_ax, b_ay: accelerometer biases in FRD body frame (m/s^2)
+   b_gz      : gyro yaw-rate bias in FRD body frame (rad/s)
    s_ax, s_ay: accelerometer scale factors (dimensionless)
 
 IMU input convention (FRD body frame):
@@ -15,12 +15,13 @@ IMU input convention (FRD body frame):
   ax_frd: forward acceleration (m/s^2, gravity-compensated)
   ay_frd: rightward acceleration (m/s^2, gravity-compensated)
   gz_frd: yaw-rate positive nose-right / clockwise (rad/s)
+         → equivalent to negative ENU yaw rate (gz_enu = -gz_frd)
 
 Sonar measurement (body frame):
   z = [d_forward, d_right, d_theta]
   d_forward: displacement forward   (meters)
   d_right  : displacement rightward (meters)
-  d_theta  : heading change         (rad)
+  d_theta  : heading change         (rad, CCW positive)
 """
 
 from __future__ import annotations
@@ -138,14 +139,16 @@ class ESEKF:
         ay_c = (ay_m - b_ay) / s_ay
         gz_c = gz_m - b_gz
 
-        # Rotation: body → NED
+        # Rotation: FRD body → ENU  (theta = ENU yaw, CCW from East)
+        # Forward maps to [cos θ, sin θ], Right maps to [sin θ, -cos θ] in ENU
         c, s = np.cos(theta), np.sin(theta)
-        ax_ned = c * ax_c - s * ay_c
-        ay_ned = s * ax_c + c * ay_c
+        ax_enu = c * ax_c + s * ay_c    # East component
+        ay_enu = s * ax_c - c * ay_c    # North component
 
-        # Centripetal correction: ω × v  (2-D)
-        ax_total = ax_ned + (-gz_c * vy)
-        ay_total = ay_ned + ( gz_c * vx)
+        # Centripetal correction: ω_enu × v_enu  (2-D, ω_enu = -gz_c)
+        # vx = East velocity, vy = North velocity
+        ax_total = ax_enu + gz_c * vy
+        ay_total = ay_enu - gz_c * vx
 
         # ------ Linearised continuous-time Jacobian (10×10) ------
         Fc = np.zeros((10, 10))
@@ -153,32 +156,32 @@ class ESEKF:
         Fc[0, 2] = 1.0
         Fc[1, 3] = 1.0
 
-        Fc[2, 3] = -gz_c
-        Fc[3, 2] =  gz_c
+        Fc[2, 3] =  gz_c   # d(ax_east)/d(vy_north): centripetal +gz_c*vy
+        Fc[3, 2] = -gz_c   # d(ay_north)/d(vx_east): centripetal -gz_c*vx
 
-        fvx_th = -s * ax_c - c * ay_c
-        fvy_th =  c * ax_c - s * ay_c
+        fvx_th = -s * ax_c + c * ay_c   # d(ax_east)/d(theta)
+        fvy_th =  c * ax_c + s * ay_c   # d(ay_north)/d(theta)
         Fc[0, 4] = 0.5 * dt * fvx_th
         Fc[1, 4] = 0.5 * dt * fvy_th
         Fc[2, 4] = fvx_th
         Fc[3, 4] = fvy_th
 
         Fc[2, 5] = -c / s_ax
-        Fc[2, 6] =  s / s_ay
+        Fc[2, 6] = -s / s_ay   # ENU: d(ax_east)/d(b_ay) = -s/s_ay
         Fc[3, 5] = -s / s_ax
-        Fc[3, 6] = -c / s_ay
+        Fc[3, 6] =  c / s_ay   # ENU: d(ay_north)/d(b_ay) = +c/s_ay
 
-        Fc[2, 7] =  vy
-        Fc[3, 7] = -vx
+        Fc[2, 7] = -vy   # d(ax_east)/d(b_gz): centripetal sign from ω_enu = -gz_c
+        Fc[3, 7] =  vx   # d(ay_north)/d(b_gz)
 
         dax_dsax = -(ax_m - b_ax) / (s_ax ** 2)
         day_dsay = -(ay_m - b_ay) / (s_ay ** 2)
         Fc[2, 8] =  c * dax_dsax
-        Fc[2, 9] = -s * day_dsay
+        Fc[2, 9] =  s * day_dsay   # ENU: d(ax_east)/d(s_ay) = +s*day_dsay
         Fc[3, 8] =  s * dax_dsax
-        Fc[3, 9] =  c * day_dsay
+        Fc[3, 9] = -c * day_dsay   # ENU: d(ay_north)/d(s_ay) = -c*day_dsay
 
-        Fc[4, 7] = -1.0
+        Fc[4, 7] = 1.0   # d(theta_enu)/d(b_gz): theta -= gz_c*dt → d/d(b_gz) = +1
 
         F = np.eye(10) + dt * Fc
 
@@ -186,19 +189,19 @@ class ESEKF:
         Gd = np.zeros((10, 8))
 
         Gd[0, 0] = 0.5 * dt**2 * c / s_ax
-        Gd[0, 1] = -0.5 * dt**2 * s / s_ay
+        Gd[0, 1] = 0.5 * dt**2 * s / s_ay    # ENU sign flip
         Gd[1, 0] = 0.5 * dt**2 * s / s_ax
-        Gd[1, 1] = 0.5 * dt**2 * c / s_ay
+        Gd[1, 1] = -0.5 * dt**2 * c / s_ay   # ENU sign flip
 
         Gd[2, 0] = dt * c / s_ax
-        Gd[2, 1] = -dt * s / s_ay
+        Gd[2, 1] = dt * s / s_ay              # ENU sign flip
         Gd[3, 0] = dt * s / s_ax
-        Gd[3, 1] = dt * c / s_ay
+        Gd[3, 1] = -dt * c / s_ay             # ENU sign flip
 
-        Gd[2, 2] = -dt * vy
-        Gd[3, 2] =  dt * vx
+        Gd[2, 2] =  dt * vy   # ENU sign flip: centripetal noise on vx_east
+        Gd[3, 2] = -dt * vx   # ENU sign flip: centripetal noise on vy_north
 
-        Gd[4, 2] = dt
+        Gd[4, 2] = -dt         # ENU: theta -= gz_c*dt
 
         Gd[5, 3] = dt
         Gd[6, 4] = dt
@@ -219,12 +222,12 @@ class ESEKF:
         Qd = Gd @ Qn @ Gd.T
 
         # ------ Propagate nominal state ------
-        self.px    += vx * dt + 0.5 * ax_total * dt**2
-        self.py    += vy * dt + 0.5 * ay_total * dt**2
+        self.px    += vx * dt + 0.5 * ax_total * dt**2   # East
+        self.py    += vy * dt + 0.5 * ay_total * dt**2   # North
         self.vx    += ax_total * dt
         self.vy    += ay_total * dt
-        self.theta += gz_c * dt
-        self.theta  = self._wrap_to_2pi(self.theta)
+        self.theta -= gz_c * dt                           # ENU: CCW positive, gz_c is CW
+        self.theta  = self._wrap_angle(self.theta)        # wrap to [-π, π]
 
         # ------ Propagate covariance ------
         self.P = F @ self.P @ F.T + Qd
@@ -254,16 +257,17 @@ class ESEKF:
             self.prev_theta = self.theta
             return None, None
 
-        # Global displacement since last sonar update
-        dp_n = self.px - self.prev_px
-        dp_e = self.py - self.prev_py
+        # Global ENU displacement since last sonar update (px=East, py=North)
+        dp_e = self.px - self.prev_px
+        dp_n = self.py - self.prev_py
 
-        # Predicted body-frame displacement
+        # Predicted body-frame displacement from ENU displacement
+        # Forward in ENU: [cos θ, sin θ];  Right in ENU: [sin θ, -cos θ]
         c = np.cos(self.prev_theta)
         s = np.sin(self.prev_theta)
         z_pred = np.array([
-            c * dp_n + s * dp_e,                             # forward
-           -s * dp_n + c * dp_e,                             # right
+            c * dp_e + s * dp_n,                             # forward
+            s * dp_e - c * dp_n,                             # right
             self._wrap_angle(self.theta - self.prev_theta),  # dtheta
         ])
 
@@ -271,10 +275,10 @@ class ESEKF:
         y = z_sonar - z_pred
         y[2] = self._wrap_angle(y[2])
 
-        # Measurement Jacobian (3×10)
+        # Measurement Jacobian (3×10)  — ENU: px=East (col 0), py=North (col 1)
         H = np.zeros((3, 10))
-        H[0, 0] =  c;  H[0, 1] = s
-        H[1, 0] = -s;  H[1, 1] = c
+        H[0, 0] =  c;  H[0, 1] =  s   # d(fwd)/d(px_east, py_north)
+        H[1, 0] =  s;  H[1, 1] = -c   # d(right)/d(px_east, py_north)
         H[2, 4] =  1.0
 
         R = self._build_R()
@@ -294,7 +298,7 @@ class ESEKF:
         K  = self.P @ H.T @ S_inv
         dx = K @ y
         self._set_from_vector(self._as_vector() + dx)
-        self.theta = self._wrap_to_2pi(self.theta)
+        self.theta = self._wrap_angle(self.theta)
 
         # Joseph-form covariance update
         I_KH = np.eye(10) - K @ H
